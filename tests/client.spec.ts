@@ -1,21 +1,25 @@
+import { randomUUID } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 import { StripeClient, StripeError } from '../src/client.js'
 
 /** Deterministic DNS so the suite never depends on resolution. */
 const publicLookup = async () => [{ address: '93.184.216.34', family: 4 as const }]
 
+const testKey = process.env.STRIPE_TEST_KEY ?? `rk_test_${randomUUID()}`
+const testSecretKey = process.env.STRIPE_TEST_SECRET_KEY ?? `rk_secret_${randomUUID()}`
+
 function response(status: number, body: unknown, headers: Record<string, string> = {}): Response { return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', ...headers } }) }
 function parts(call: unknown[]): [string, RequestInit] { return [String(call[0]), (call[1] ?? {}) as RequestInit] }
 describe('StripeClient', () => {
   it('uses Basic authentication and maps account fields', async () => {
     const fetchImpl = vi.fn(async () => response(200, { id: 'acct_1', country: 'US', default_currency: 'usd', business_profile: { name: 'Acme' }, charges_enabled: true, payouts_enabled: false, external_accounts: { data: [{ secret: 'omit' }] } }))
-    const client = new StripeClient({ lookupImpl: publicLookup, apiKey: 'rk_test_secret', fetchImpl })
+    const client = new StripeClient({ lookupImpl: publicLookup, apiKey: testSecretKey, fetchImpl })
     await expect(client.authTest()).resolves.toEqual({ id: 'acct_1', country: 'US', defaultCurrency: 'usd', businessName: 'Acme', chargesEnabled: true, payoutsEnabled: false })
-    const [, init] = parts(fetchImpl.mock.calls[0]); expect(new Headers(init.headers).get('authorization')).toBe('Basic ' + Buffer.from('rk_test_secret:').toString('base64'))
+    const [, init] = parts(fetchImpl.mock.calls[0]); expect(new Headers(init.headers).get('authorization')).toBe('Basic ' + Buffer.from(testSecretKey + ':').toString('base64'))
   })
   it('maps cursor lists and clamps limits', async () => {
     const fetchImpl = vi.fn(async () => response(200, { object: 'list', data: [{ id: 'cus_1', email: 'a@example.com', name: 'Alice', created: 10 }], has_more: true }))
-    const client = new StripeClient({ lookupImpl: publicLookup, apiKey: 'rk_test', fetchImpl })
+    const client = new StripeClient({ lookupImpl: publicLookup, apiKey: testKey, fetchImpl })
     const result = await client.listCustomers({ email: 'a@example.com', limit: 999, startingAfter: 'cus_0' })
     expect(result).toMatchObject({ items: [{ id: 'cus_1', email: 'a@example.com' }], hasMore: true, nextCursor: 'cus_1' })
     const [url] = parts(fetchImpl.mock.calls[0]); expect(url).toContain('/v1/customers?'); expect(url).toContain('limit=100'); expect(url).toContain('starting_after=cus_0')
@@ -26,7 +30,7 @@ describe('StripeClient', () => {
       .mockResolvedValueOnce(response(200, { data: [{ id: 'sub_1', status: 'active', customer: 'cus_1', current_period_start: 1, current_period_end: 2, cancel_at_period_end: false, collection_method: 'charge_automatically', items: { data: [{ price: { currency: 'usd' } }] }, latest_invoice: { client_secret: 'omit' } }], has_more: false }))
       .mockResolvedValueOnce(response(200, { data: [{ id: 'in_1', number: 'INV-1', status: 'open', customer: 'cus_1', amount_due: 100, amount_paid: 0, currency: 'usd', created: 1, due_date: 2, hosted_invoice_url: 'omit' }], has_more: false }))
       .mockResolvedValueOnce(response(200, { data: [{ id: 'pi_1', status: 'succeeded', amount: 100, currency: 'usd', customer: 'cus_1', created: 1, description: 'ok', client_secret: 'omit' }], has_more: false }))
-    const client = new StripeClient({ lookupImpl: publicLookup, apiKey: 'rk_test', fetchImpl })
+    const client = new StripeClient({ lookupImpl: publicLookup, apiKey: testKey, fetchImpl })
     await expect(client.listProducts()).resolves.toMatchObject({ items: [{ id: 'prod_1', defaultPriceId: 'price_1' }] })
     await expect(client.listSubscriptions()).resolves.toMatchObject({ items: [{ id: 'sub_1', currency: 'usd' }] })
     await expect(client.listInvoices()).resolves.toMatchObject({ items: [{ id: 'in_1', amountDue: 100 }] })
@@ -40,7 +44,7 @@ describe('StripeClient', () => {
         recurring: { interval: 'month', interval_count: 1 }, billing_scheme: 'per_unit', tax_behavior: 'exclusive', metadata: { secret: 'omit' },
       }], has_more: true,
     }))
-    const client = new StripeClient({ lookupImpl: publicLookup, apiKey: 'rk_test', fetchImpl })
+    const client = new StripeClient({ lookupImpl: publicLookup, apiKey: testKey, fetchImpl })
     await expect(client.listPrices({ productId: 'prod_1', active: true, type: 'recurring', currency: 'usd', limit: 999, startingAfter: 'price_0' })).resolves.toMatchObject({
       items: [{ id: 'price_1', productId: 'prod_1', unitAmount: 1200, recurringInterval: 'month', recurringIntervalCount: 1 }], hasMore: true, nextCursor: 'price_1',
     })
@@ -54,14 +58,14 @@ describe('StripeClient', () => {
   })
   it('surfaces Stripe errors and Retry-After without leaking the key', async () => {
     const fetchImpl = vi.fn(async () => response(429, { error: { message: 'rate limited', payment_method: 'omit' } }, { 'retry-after': '2', 'request-id': 'req_1' }))
-    const client = new StripeClient({ lookupImpl: publicLookup, apiKey: 'rk_test_secret', fetchImpl })
+    const client = new StripeClient({ lookupImpl: publicLookup, apiKey: testSecretKey, fetchImpl })
     await expect(client.listProducts()).rejects.toThrow('rate limited')
-    await expect(client.listProducts()).rejects.not.toThrow('rk_test_secret')
+    await expect(client.listProducts()).rejects.not.toThrow(testSecretKey)
   })
 })
 
 describe('Stripe endpoint security', () => {
-  const valid = { apiKey: 'rk_test' }
+  const valid = { apiKey: testKey }
 
   it('rejects invalid base URLs without exposing their contents', () => {
     for (const baseUrl of [
