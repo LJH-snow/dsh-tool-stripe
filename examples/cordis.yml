@@ -1,0 +1,6 @@
+# dsh-tool-stripe 组合示例
+- name: '@libai168/dsh-tool-stripe'
+  config:
+    # 使用 Stripe Restricted API Key，只授予所需的 read 权限。
+    apiKey: 'rk_test_replace_with_a_read_only_key'
+    # timeoutMs: 15000
